@@ -7,10 +7,12 @@ have been inactive for a configurable number of days. It supports an allow list 
 regular expressions) so you can always include or always exclude specific branches.
 
 Why I created this:
+
 - Hide or skip discovery of stale branches without deleting them on the remote.
 - Keep historical Jenkinsfiles in the repo while avoiding unnecessary indexing/builds.
 
 Key behaviors:
+
 - Inactivity is based on `SCMFileSystem.lastModified()` for the branch head.
   For Git, this corresponds to the commit timestamp of the HEAD revision.
 - Deny list takes precedence over allow list.
@@ -32,26 +34,33 @@ Key behaviors:
 Examples:
 
 Allow list master and main (default):
+
 ```
 master
 main
 ```
 
 Exclude all WIP branches:
+
 ```
 wip/.*
 ```
 
 Job DSL example:
+
 ```
-multibranchPipelineJob('ConfigurationManager') {
+multibranchPipelineJob('X') {
   branchSources {
-    git {
-      traits {
-        inactiveBranchFilter {
-          inactivityDays(10)
-          allowlist('master\nmain\n.*release.*')
-          denylist('')
+    branchSource {
+      source {
+        git {
+          traits {
+            inactiveBranchFilter {
+              inactivityDays(10)
+              allowlist('master\nmain\n.*release.*')
+              denylist('')
+            }
+          }
         }
       }
     }
