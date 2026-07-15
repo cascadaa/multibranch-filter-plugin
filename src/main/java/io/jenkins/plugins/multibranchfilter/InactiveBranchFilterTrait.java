@@ -4,20 +4,19 @@ import edu.umd.cs.findbugs.annotations.Nullable;
 import hudson.Extension;
 import hudson.model.TaskListener;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
-import jenkins.scm.api.SCMFileSystem;
 import jenkins.scm.api.SCMHead;
-import jenkins.scm.api.SCMSource;
+import jenkins.scm.api.SCMSourceCriteria;
 import jenkins.scm.api.mixin.ChangeRequestSCMHead;
 import jenkins.scm.api.mixin.TagSCMHead;
 import jenkins.scm.api.trait.SCMHeadFilter;
@@ -33,8 +32,6 @@ public class InactiveBranchFilterTrait extends SCMSourceTrait {
     private static final Logger LOGGER = Logger.getLogger(InactiveBranchFilterTrait.class.getName());
     private static final String SPLIT_REGEX = "[\\r\\n]+";
     private static final String DEFAULT_ALLOWLIST = "master\nmain";
-    private static volatile boolean sourceFieldInitialized;
-    private static volatile Field sourceField;
 
     private final int inactivityDays;
     private String allowlist;
@@ -74,7 +71,10 @@ public class InactiveBranchFilterTrait extends SCMSourceTrait {
         List<Pattern> allowlistPatterns = parsePatternList(getAllowlist());
         List<Pattern> denylistPatterns = parsePatternList(getDenylist());
         int inactivityDays = this.inactivityDays;
+        long cutoff = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(inactivityDays);
+        Set<String> ageExemptHeads = ConcurrentHashMap.newKeySet();
 
+        // Apply cheap name and head-type rules before the source creates a revision probe.
         context.withFilter(new SCMHeadFilter() {
             @Override
             public boolean isExcluded(SCMSourceRequest request, SCMHead head) throws IOException, InterruptedException {
@@ -85,10 +85,12 @@ public class InactiveBranchFilterTrait extends SCMSourceTrait {
                     return true;
                 }
                 if (matchesAny(name, allowlistPatterns)) {
+                    ageExemptHeads.add(name);
                     logDecision(listener, name, false, "allow-list");
                     return false;
                 }
                 if (head instanceof ChangeRequestSCMHead || head instanceof TagSCMHead) {
+                    ageExemptHeads.add(name);
                     logDecision(listener, name, false, "change-request-or-tag");
                     return false;
                 }
@@ -97,38 +99,16 @@ public class InactiveBranchFilterTrait extends SCMSourceTrait {
                     return false;
                 }
 
-                SCMSource source = extractSource(request);
-                if (source == null) {
-                    logDecision(listener, name, false, "scm-source-unavailable");
-                    return false;
-                }
-
-                SCMFileSystem fileSystem = SCMFileSystem.of(source, head);
-                if (fileSystem == null) {
-                    logDecision(listener, name, false, "scm-filesystem-unavailable");
-                    return false;
-                }
-                try (SCMFileSystem closeable = fileSystem) {
-                    long lastModified = closeable.lastModified();
-                    if (lastModified <= 0L) {
-                        logDecision(listener, name, false, "last-modified-unavailable");
-                        return false;
-                    }
-                    long cutoff = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(inactivityDays);
-                    boolean excluded = lastModified < cutoff;
-                    logDecision(
-                            listener,
-                            name,
-                            excluded,
-                            "age-check lastModified=" + new Date(lastModified) + " cutoff=" + new Date(cutoff));
-                    return excluded;
-                } catch (UnsupportedOperationException e) {
-                    LOGGER.log(Level.FINE, "SCMFileSystem does not support lastModified for {0}", name);
-                    logDecision(listener, name, false, "last-modified-unsupported");
-                    return false;
-                }
+                // Clear a stale exemption if another head reused this name in the same scan.
+                ageExemptHeads.remove(name);
+                return false;
             }
         });
+
+        if (inactivityDays > 0) {
+            // Reuse the source's probe, which Git creates from its single scan-wide fetch.
+            context.withCriteria(new InactivityCriteria(cutoff, ageExemptHeads));
+        }
     }
 
     private static String normalizeList(String raw) {
@@ -176,38 +156,43 @@ public class InactiveBranchFilterTrait extends SCMSourceTrait {
                         + " reason=" + reason);
     }
 
-    private static SCMSource extractSource(SCMSourceRequest request) {
-        Field field = getSourceField();
-        if (field == null) {
-            return null;
-        }
-        try {
-            return (SCMSource) field.get(request);
-        } catch (IllegalAccessException e) {
-            LOGGER.log(Level.FINE, "Unable to access SCMSource from request", e);
-            return null;
-        }
-    }
+    static final class InactivityCriteria implements SCMSourceCriteria {
+        private static final long serialVersionUID = 1L;
 
-    private static Field getSourceField() {
-        if (sourceFieldInitialized) {
-            return sourceField;
+        private final long cutoff;
+        private final Set<String> ageExemptHeads;
+
+        InactivityCriteria(long cutoff, Set<String> ageExemptHeads) {
+            this.cutoff = cutoff;
+            this.ageExemptHeads = ageExemptHeads;
         }
-        synchronized (InactiveBranchFilterTrait.class) {
-            if (!sourceFieldInitialized) {
-                try {
-                    // SCMSourceRequest does not expose the SCMSource; use reflection to access it.
-                    Field field = SCMSourceRequest.class.getDeclaredField("source");
-                    field.setAccessible(true);
-                    sourceField = field;
-                } catch (NoSuchFieldException | RuntimeException e) {
-                    LOGGER.log(Level.FINE, "Unable to locate SCMSourceRequest source field", e);
-                    sourceField = null;
+
+        @Override
+        public boolean isHead(SCMSourceCriteria.Probe probe, TaskListener listener) throws IOException {
+            String name = probe.name();
+            // Preserve allow-list and pull-request/tag inclusions while consuming the one-shot marker.
+            if (ageExemptHeads.remove(name)) {
+                return true;
+            }
+            try {
+                long lastModified = probe.lastModified();
+                if (lastModified <= 0L) {
+                    logDecision(listener, name, false, "last-modified-unavailable");
+                    return true;
                 }
-                sourceFieldInitialized = true;
+                boolean excluded = lastModified < cutoff;
+                logDecision(
+                        listener,
+                        name,
+                        excluded,
+                        "age-check lastModified=" + new Date(lastModified) + " cutoff=" + new Date(cutoff));
+                return !excluded;
+            } catch (UnsupportedOperationException e) {
+                LOGGER.log(Level.FINE, "SCM probe does not support lastModified for {0}", name);
+                logDecision(listener, name, false, "last-modified-unsupported");
+                return true;
             }
         }
-        return sourceField;
     }
 
     @Extension
